@@ -1,0 +1,402 @@
+import json, hashlib, secrets, math
+from dataclasses import dataclass, asdict
+from typing import List, Tuple, Dict, Any
+
+# ========== Field (Goldilocks) ==========
+P = (1<<64) - (1<<32) + 1  # 2^64 - 2^32 + 1
+PRIMITIVE_ROOT = 7         # works as a generator for large 2^k subgroups in Goldilocks
+
+def fadd(a,b): return (a+b) % P
+def fsub(a,b): return (a-b) % P
+def fmul(a,b): return (a*b) % P
+def finv(a): return pow(a, P-2, P)
+def fneg(a): return (-a) % P
+def fpow(a,e): return pow(a,e,P)
+
+def root_of_unity(n: int) -> int:
+    # returns ω such that ω^n == 1
+    assert (P-1) % n == 0
+    return fpow(PRIMITIVE_ROOT, (P-1)//n)
+
+# ========== Merkle commitments ==========
+def sha256(b: bytes) -> bytes:
+    return hashlib.sha256(b).digest()
+
+def leaf_hash(b: bytes) -> bytes:
+    return sha256(b'\x00'+b)
+
+def node_hash(l: bytes, r: bytes) -> bytes:
+    return sha256(b'\x01'+l+r)
+
+def merkle_tree(leaves: List[bytes]) -> Tuple[bytes, List[List[bytes]]]:
+    n = 1
+    while n < len(leaves):
+        n <<= 1
+    # Hash all real leaves up-front so verify() can call leaf_hash(leaf) consistently
+    hashed = [leaf_hash(leaf) for leaf in leaves]
+    arr = hashed + [leaf_hash(b'')]*(n - len(leaves))
+    levels = [arr]
+    while len(arr) > 1:
+        nxt = []
+        for i in range(0, len(arr), 2):
+            nxt.append(node_hash(arr[i], arr[i+1]))
+        levels.append(nxt)
+        arr = nxt
+    return levels[-1][0], levels
+
+def merkle_proof(levels: List[List[bytes]], idx: int) -> List[Tuple[int, bytes]]:
+    proof = []
+    i = idx
+    for lvl in range(0, len(levels)-1):
+        arr = levels[lvl]
+        if i % 2 == 0:
+            sib = arr[i+1] if i+1 < len(arr) else leaf_hash(b'')
+            proof.append((1, sib))
+        else:
+            sib = arr[i-1]
+            proof.append((0, sib))
+        i //= 2
+    return proof
+
+def merkle_verify(root: bytes, leaf: bytes, idx: int, proof: List[Tuple[int, bytes]]) -> bool:
+    h = leaf_hash(leaf)
+    i = idx
+    for side, sib in proof:
+        if side == 1:
+            h = node_hash(h, sib)
+        else:
+            h = node_hash(sib, h)
+        i //= 2
+    return h == root
+
+# ========== HM→rZK Trace (same semantics as full-trace) ==========
+@dataclass
+class Step:
+    idx: int
+    op: str
+    j: int
+    b: int
+    d: int
+    r: int
+    c: int
+    ct: List[int]
+    u:  List[int]
+    s:  List[int]
+    lhs:List[int]
+    rhs:List[int]
+    ok: List[int]  # 0/1
+
+def bit_length(d: int) -> int:
+    return max(1, d.bit_length())
+
+def build_trace(P_list: List[int], d: int, r: int) -> List[Step]:
+    steps: List[Step] = []
+    b = 0; c = 0
+    ct = [0]*len(P_list); u = [0]*len(P_list); s=[0]*len(P_list)
+    lhs=[0]*len(P_list); rhs=[0]*len(P_list); ok=[0]*len(P_list)
+
+    def capture(op, j=-1):
+        steps.append(Step(len(steps), op, j, b, d, r, c, ct[:], u[:], s[:], lhs[:], rhs[:], ok[:]))
+
+    capture("init")
+    b = bit_length(d); capture("compute_b")
+    for j,P in enumerate(P_list):
+        ct[j] = pow(d, b, P); capture("compute_ct", j)
+        u[j]  = pow(r, b, P); capture("compute_u", j)
+    h = hashlib.sha256()
+    h.update(b"RZK|TRACE|LINK|")
+    for P in P_list: h.update(str(P).encode())
+    h.update(str(b).encode())
+    for v in ct: h.update(str(v).encode())
+    for v in u:  h.update(str(v).encode())
+    c = int.from_bytes(h.digest(), 'big'); capture("compute_c")
+    for j,P in enumerate(P_list):
+        s[j]   = (r * pow(d, c % (P-1), P)) % P; capture("compute_s", j)
+        lhs[j] = pow(s[j], b, P); capture("compute_lhs", j)
+        rhs[j] = (u[j] * pow(ct[j], c % (P-1), P)) % P; capture("compute_rhs", j)
+        ok[j]  = 1 if lhs[j] == rhs[j] else 0; capture("check_ok", j)
+    capture("done")
+    return steps
+
+# ========== Composition residual vector (vanishes if all checks pass) ==========
+# We'll build a vector CP[t] ∈ F_p by hashing (Fiat–Shamir) into random coeffs
+# and mixing the residuals at each step. When constraints are satisfied, CP=0.
+
+def to_field(x: int) -> int:
+    return x % P
+
+def residuals(prev: Step, nxt: Step, P_list: List[int]) -> List[int]:
+    rlist = []
+    if nxt.idx != prev.idx + 1: rlist.append(1)  # structural sanity
+    # keep d,r constant
+    rlist.append(to_field(nxt.d - prev.d))
+    rlist.append(to_field(nxt.r - prev.r))
+
+    def blen(x): return max(1, x.bit_length())
+
+    op = nxt.op; j = nxt.j
+    if op == "compute_b":
+        rlist.append(to_field(nxt.b - blen(prev.d)))
+    elif op == "compute_ct":
+        P = P_list[j]
+        rlist.append(to_field(nxt.ct[j] - pow(prev.d, prev.b, P)))
+    elif op == "compute_u":
+        P = P_list[j]
+        rlist.append(to_field(nxt.u[j] - pow(prev.r, prev.b, P)))
+    elif op == "compute_c":
+        h = hashlib.sha256()
+        h.update(b"RZK|TRACE|LINK|")
+        for PP in P_list: h.update(str(PP).encode())
+        h.update(str(prev.b).encode())
+        for v in prev.ct: h.update(str(v).encode())
+        for v in prev.u:  h.update(str(v).encode())
+        expect = int.from_bytes(h.digest(),'big')
+        rlist.append(to_field(nxt.c - expect))
+    elif op == "compute_s":
+        P = P_list[j]
+        rlist.append(to_field(nxt.s[j] - (prev.r * pow(prev.d, prev.c % (P-1), P)) % P))
+    elif op == "compute_lhs":
+        P = P_list[j]
+        rlist.append(to_field(nxt.lhs[j] - pow(prev.s[j], prev.b, P)))
+    elif op == "compute_rhs":
+        P = P_list[j]
+        rlist.append(to_field(nxt.rhs[j] - (prev.u[j] * pow(prev.ct[j], prev.c % (P-1), P)) % P))
+    elif op == "check_ok":
+        rlist.append(to_field(nxt.ok[j] - (1 if prev.lhs[j] == prev.rhs[j] else 0)))
+    elif op == "done":
+        # require all ok==1 in prev
+        bad = sum(1 for v in prev.ok if v != 1)
+        rlist.append(to_field(bad))
+    else:
+        # init step shouldn't be checked here
+        pass
+    return rlist
+
+def fiat_shamir_coeffs(seed: bytes, k: int) -> List[int]:
+    out = []
+    h = hashlib.sha256(seed).digest()
+    while len(out) < k:
+        h = hashlib.sha256(h).digest()
+        # chunk into 8-byte limbs
+        for i in range(0, len(h), 8):
+            limb = int.from_bytes(h[i:i+8], 'big') % P
+            if limb != 0:
+                out.append(limb)
+            if len(out) >= k: break
+    return out
+
+def build_composition_vector(steps: List[Step], P_list: List[int]) -> List[int]:
+    # CP length = next power of two >= (len(steps)-1). Fill remainder with zeros.
+    n = len(steps) - 1
+    N = 1
+    while N < n: N <<= 1
+    cp = [0]*N
+    seed = b"RZK|R-IOP|CP|"
+    kmax = 8
+    coeffs = fiat_shamir_coeffs(seed, kmax)
+    for i in range(n):
+        prev, nxt = steps[i], steps[i+1]
+        res = residuals(prev, nxt, P_list)
+        # mix residuals into a single field element
+        acc = 0
+        for j, r in enumerate(res):
+            acc = fadd(acc, fmul(coeffs[j % kmax], to_field(r)))
+        cp[i] = acc  # if all constraints satisfied, acc should be 0
+    # pad remains 0
+    return cp
+
+# ========== FRI-style folding ==========
+@dataclass
+class FRILayer:
+    root: bytes
+    values: List[int]     # evaluation vector at this layer
+    tree:  List[List[bytes]]
+
+@dataclass
+class FRIProof:
+    layers: List[FRILayer]  # only roots kept in proof object we export
+    queries: List[Dict[str, Any]]
+    final_value: int
+    domain_size: int
+    blowup: int
+
+def commit_vector(vec: List[int]) -> FRILayer:
+    leaves = [int(v).to_bytes(32,'big') for v in vec]
+    root, tree = merkle_tree(leaves)
+    return FRILayer(root=root, values=vec, tree=tree)
+
+def fold_pairwise(vec: List[int], alpha: int) -> List[int]:
+    # y'[i] = y[2i] + alpha * y[2i+1]
+    assert len(vec) % 2 == 0
+    out = []
+    for i in range(0, len(vec), 2):
+        out.append(fadd(vec[i], fmul(alpha, vec[i+1])))
+    return out
+
+def prove_fri(cp: List[int], blowup: int = 4, rounds: int = 0, num_queries: int = 16) -> Dict[str, Any]:
+    # LDE by repeating (simple) — for true STARK we'd interpolate & evaluate on larger domain.
+    # Here we expand by repeating each entry blowup times to simulate an LDE.
+    base = []
+    for v in cp:
+        base.extend([v]*blowup)
+    vec = base[:]
+    layers = []
+    # random alphas from FS
+    alphas = fiat_shamir_coeffs(b"RZK|R-IOP|FRI|alpha", 64)
+    layer_idx = 0
+    while len(vec) > 1:
+        lay = commit_vector(vec)
+        layers.append(lay)
+        alpha = alphas[layer_idx]
+        if len(vec) % 2 == 1: vec.append(0)
+        vec = fold_pairwise(vec, alpha)
+        layer_idx += 1
+        if rounds and layer_idx >= rounds: break
+    final_value = vec[0]
+    # Query a set of positions on the first layer and follow them down
+    total = len(layers[0].values) if layers else len(base)
+    seed = sha256(b"RZK|R-IOP|FRI|query" + layers[0].root if layers else b'\x00')
+    picks = set()
+    while len(picks) < num_queries and total > 0:
+        seed = sha256(seed)
+        idx = int.from_bytes(seed, 'big') % total
+        picks.add(idx)
+    queries = []
+    for q in picks:
+        qdata = []
+        idx = q
+        curr_vec = base
+        curr_root, curr_tree = (layers[0].root, layers[0].tree) if layers else (b'', [])
+        # prove inclusion at each layer
+        for li, lay in enumerate(layers):
+            leaf = int(curr_vec[idx]).to_bytes(32,'big')
+            proof = merkle_proof(lay.tree, idx)
+            qdata.append({
+                "layer": li,
+                "idx": idx,
+                "leaf": leaf.hex(),
+                "proof": [(s, h.hex()) for (s,h) in proof],
+                "root": lay.root.hex()
+            })
+            # compute next idx
+            if idx % 2 == 0:
+                pair = curr_vec[idx+1] if idx+1 < len(curr_vec) else 0
+                curr = curr_vec[idx]
+            else:
+                pair = curr_vec[idx-1]
+                curr = curr_vec[idx-1]  # when odd, pairwise fold uses (idx-1, idx)
+            idx //= 2
+            # set next vector for iteration
+            alpha = alphas[li]
+            next_vec = []
+            for i in range(0, len(curr_vec)+(len(curr_vec)%2), 2):
+                v0 = curr_vec[i]
+                v1 = curr_vec[i+1] if i+1 < len(curr_vec) else 0
+                next_vec.append(fadd(v0, fmul(alpha, v1)))
+            curr_vec = next_vec
+        queries.append({"path": qdata})
+    proof = {
+        "scheme": "resonancefri-v1",
+        "fri": {
+            "layers": [{"root": lay.root.hex(), "len": len(lay.values)} for lay in layers],
+            "final_value": int(final_value),
+            "blowup": blowup,
+            "num_queries": len(queries),
+        },
+        "queries": queries
+    }
+    return proof, layers, base, alphas
+
+
+def verify_fri(proof: Dict[str, Any]) -> bool:
+    if proof.get("scheme") != "resonancefri-v1":
+        return False
+    layers = proof["fri"]["layers"]
+    if not layers:
+        return False
+    # For each query path, verify Merkle inclusion at each layer.
+    for q in proof["queries"]:
+        for step in q["path"]:
+            root = bytes.fromhex(step["root"])
+            leaf = bytes.fromhex(step["leaf"])
+            proof_path = [(int(s), bytes.fromhex(h)) for (s,h) in step["proof"]]
+            if not merkle_verify(root, leaf, int(step["idx"]), proof_path):
+                return False
+    return True
+
+
+# ========== High-level: prove HM→rZK with R-IOP + FRI ==========
+def prove(P_list: List[int], d: int, r: int, samples: int = 24, blowup: int = 4) -> Dict[str, Any]:
+    # Build concrete trace and composition residuals
+    steps = build_trace(P_list, d, r)
+    cp = build_composition_vector(steps, P_list)  # should be identically 0 if constraints satisfied
+    # FRI proof that cp is low-degree (simulated LDE + folds)
+    fri_proof, layers, base, alphas = prove_fri(cp, blowup=blowup, num_queries=16)
+    # also attach a few random step openings (transition soundness)
+    # (reuse exact openings from first approach in spirit; keep here minimal)
+    openings = []
+    n = len(steps)-1
+    seen = set()
+    seed = sha256(b"RZK|R-IOP|TRANS|" + bytes.fromhex(fri_proof["fri"]["layers"][0]["root"]) if fri_proof["fri"]["layers"] else b"\x00")
+    while len(seen) < min(samples, n):
+        seed = sha256(seed)
+        cand = int.from_bytes(seed,'big') % n
+        seen.add(cand)
+    for i in sorted(seen):
+        prev = steps[i]; nxt = steps[i+1]
+        openings.append({"i": i, "prev": asdict(prev), "nxt": asdict(nxt)})
+    return {
+        "scheme": "rzk-resonancefri",
+        "public": {"P": [str(P) for P in P_list]},
+        "fri": fri_proof,
+        "openings": openings
+    }
+
+def verify(proof: Dict[str, Any]) -> bool:
+    if proof.get("scheme") != "rzk-resonancefri": return False
+    # verify FRI shell
+    if not verify_fri(proof["fri"]): return False
+    # verify opened transitions
+    P_list = [int(x) for x in proof["public"]["P"]]
+    for opn in proof["openings"]:
+        prev = opn["prev"]; nxt = opn["nxt"]
+        # recompute residuals
+        # (Minimal re-check, same as residuals() but inline)
+        def blen(x): return max(1, x.bit_length())
+        # structural
+        if nxt["idx"] != prev["idx"] + 1: return False
+        if nxt["d"] != prev["d"] or nxt["r"] != prev["r"]: return False
+        op = nxt["op"]; j = nxt["j"]
+        if op == "compute_b":
+            if nxt["b"] != blen(prev["d"]): return False
+        elif op == "compute_ct":
+            P = P_list[j]
+            if nxt["ct"][j] != pow(prev["d"], prev["b"], P): return False
+        elif op == "compute_u":
+            P = P_list[j]
+            if nxt["u"][j]  != pow(prev["r"], prev["b"], P): return False
+        elif op == "compute_c":
+            h = hashlib.sha256()
+            h.update(b"RZK|TRACE|LINK|")
+            for PP in P_list: h.update(str(PP).encode())
+            h.update(str(prev["b"]).encode())
+            for v in prev["ct"]: h.update(str(v).encode())
+            for v in prev["u"]:  h.update(str(v).encode())
+            expect = int.from_bytes(h.digest(),'big')
+            if nxt["c"] != expect: return False
+        elif op == "compute_s":
+            P = P_list[j]
+            if nxt["s"][j] != (prev["r"] * pow(prev["d"], prev["c"] % (P-1), P)) % P: return False
+        elif op == "compute_lhs":
+            P = P_list[j]
+            if nxt["lhs"][j] != pow(prev["s"][j], prev["b"], P): return False
+        elif op == "compute_rhs":
+            P = P_list[j]
+            if nxt["rhs"][j] != (prev["u"][j] * pow(prev["ct"][j], prev["c"] % (P-1), P)) % P: return False
+        elif op == "check_ok":
+            if nxt["ok"][j] != (1 if prev["lhs"][j] == prev["rhs"][j] else 0): return False
+        elif op == "done":
+            if any(v != 1 for v in prev["ok"]): return False
+        else:
+            pass
+    return True
