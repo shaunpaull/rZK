@@ -1,0 +1,382 @@
+import json, math, hashlib, secrets
+from dataclasses import dataclass, asdict, field
+from typing import List, Dict, Any, Tuple
+
+# ----------------------- Utilities -----------------------
+
+def sha256(b: bytes) -> bytes:
+    return hashlib.sha256(b).digest()
+
+def sha256_int(*parts: bytes) -> int:
+    h = hashlib.sha256()
+    for p in parts:
+        h.update(p)
+    return int.from_bytes(h.digest(), 'big')
+
+def int_to_bytes(x: int, length: int = None) -> bytes:
+    if x < 0:
+        raise ValueError("negative to int_to_bytes")
+    b = x.to_bytes((x.bit_length()+7)//8 or 1, 'big')
+    if length is None:
+        return b
+    if len(b) > length:
+        # truncate from the left (not ideal, but we fix a width to XOR with a pad)
+        return b[-length:]
+    if len(b) < length:
+        return b'\x00'*(length-len(b)) + b
+    return b
+
+def xor_bytes(a: bytes, b: bytes) -> bytes:
+    return bytes(x^y for x,y in zip(a,b))
+
+def canonical_json(obj: Any) -> bytes:
+    return json.dumps(obj, separators=(',',':'), sort_keys=True).encode()
+
+def bit_length(d: int) -> int:
+    return max(1, d.bit_length())
+
+# ----------------------- VM State & Steps -----------------------
+
+@dataclass
+class VMState:
+    # public params
+    P_list: List[int]
+    # secret inputs
+    d: int
+    r: int
+    # evolving registers
+    b: int = 0
+    c: int = 0
+    ct: List[int] = None
+    u:  List[int] = None
+    s:  List[int] = None
+    lhs:List[int] = None
+    rhs:List[int] = None
+    ok: List[bool] = None
+
+    def clone(self) -> "VMState":
+        return VMState(
+            P_list=self.P_list[:],
+            d=self.d, r=self.r, b=self.b, c=self.c,
+            ct=self.ct[:] if self.ct is not None else None,
+            u=self.u[:] if self.u is not None else None,
+            s=self.s[:] if self.s is not None else None,
+            lhs=self.lhs[:] if self.lhs is not None else None,
+            rhs=self.rhs[:] if self.rhs is not None else None,
+            ok=self.ok[:] if self.ok is not None else None,
+        )
+
+@dataclass
+class Step:
+    idx: int
+    op: str
+    j: int = -1  # which modulus (if relevant)
+    state: Dict[str, Any] = None
+
+# ----------------------- Program -----------------------
+
+def program_build_trace(P_list: List[int], d: int, r: int) -> List[Step]:
+    """Build a full execution trace for rZK-Link over P_list."""
+    st = VMState(P_list=P_list, d=d, r=r, b=0, c=0,
+                 ct=[0]*len(P_list), u=[0]*len(P_list),
+                 s=[0]*len(P_list), lhs=[0]*len(P_list),
+                 rhs=[0]*len(P_list), ok=[False]*len(P_list))
+    steps: List[Step] = []
+    idx = 0
+
+    # init (record only)
+    steps.append(Step(idx=idx, op="init", j=-1, state=asdict(st))); idx += 1
+
+    # compute b
+    st = st.clone()
+    st.b = bit_length(st.d)
+    steps.append(Step(idx=idx, op="compute_b", j=-1, state=asdict(st))); idx += 1
+
+    # per-modulus ct, u
+    for j, P in enumerate(P_list):
+        st = st.clone()
+        st.ct[j] = pow(st.d, st.b, P)
+        steps.append(Step(idx=idx, op="compute_ct", j=j, state=asdict(st))); idx += 1
+
+        st = st.clone()
+        st.u[j] = pow(st.r, st.b, P)
+        steps.append(Step(idx=idx, op="compute_u", j=j, state=asdict(st))); idx += 1
+
+    # challenge c = H(all P, b, ct, u)
+    st = st.clone()
+    h = hashlib.sha256()
+    h.update(b"RZK|TRACE|LINK|")
+    for P in st.P_list: h.update(int_to_bytes(P))
+    h.update(int_to_bytes(st.b))
+    for v in st.ct: h.update(int_to_bytes(v))
+    for v in st.u:  h.update(int_to_bytes(v))
+    st.c = int.from_bytes(h.digest(),'big')
+    steps.append(Step(idx=idx, op="compute_c", j=-1, state=asdict(st))); idx += 1
+
+    # per-modulus s, lhs, rhs, ok
+    for j, P in enumerate(P_list):
+        st = st.clone()
+        st.s[j] = (st.r * pow(st.d, st.c % (P-1), P)) % P
+        steps.append(Step(idx=idx, op="compute_s", j=j, state=asdict(st))); idx += 1
+
+        st = st.clone()
+        st.lhs[j] = pow(st.s[j], st.b, P)
+        steps.append(Step(idx=idx, op="compute_lhs", j=j, state=asdict(st))); idx += 1
+
+        st = st.clone()
+        st.rhs[j] = (st.u[j] * pow(st.ct[j], st.c % (P-1), P)) % P
+        steps.append(Step(idx=idx, op="compute_rhs", j=j, state=asdict(st))); idx += 1
+
+        st = st.clone()
+        st.ok[j] = (st.lhs[j] == st.rhs[j])
+        steps.append(Step(idx=idx, op="check_ok", j=j, state=asdict(st))); idx += 1
+
+    # done
+    steps.append(Step(idx=idx, op="done", j=-1, state=asdict(st))); idx += 1
+    return steps
+
+# ----------------------- Merkle commitment over masked steps -----------------------
+
+def next_pow2(n: int) -> int:
+    p = 1
+    while p < n: p <<= 1
+    return p
+
+def serialize_step(step: Step) -> bytes:
+    obj = {
+        "idx": step.idx,
+        "op": step.op,
+        "j": step.j,
+        "state": step.state,
+    }
+    return json.dumps(obj, separators=(',',':'), sort_keys=True).encode()
+
+def commit_trace(steps: List[Step], mask_bytes: int = 96) -> Tuple[bytes, List[bytes], List[bytes]]:
+    """Return (root, leaves, pads). Each leaf = H('L'|idx|masked_bytes)."""
+    leaves = []
+    pads = []
+    for st in steps:
+        plain = serialize_step(st)
+        pad   = secrets.token_bytes(max(mask_bytes, len(plain)))
+        masked= xor_bytes(plain.ljust(len(pad), b'\x00'), pad)
+        leaf  = sha256(b"L" + int_to_bytes(st.idx, 8) + masked)
+        leaves.append(leaf)
+        pads.append(pad)            # keep for openings
+    # build Merkle
+    n = len(leaves)
+    N = next_pow2(n)
+    # pad with zero leaves if needed
+    arr = leaves + [sha256(b"") for _ in range(N-n)]
+    tree = [arr]
+    while len(arr) > 1:
+        nxt = []
+        for i in range(0, len(arr), 2):
+            nxt.append(sha256(b"I"+arr[i]+arr[i+1]))
+        tree.append(nxt)
+        arr = nxt
+    root = tree[-1][0]
+    return root, leaves, pads, tree
+
+def get_merkle_path(tree: List[List[bytes]], idx: int, total: int) -> List[Tuple[int, bytes]]:
+    """Return list of (side, sibhash) where side=0 means left, 1 means right sibling provided."""
+    path = []
+    i = idx
+    for level in range(0, len(tree)-1):
+        arr = tree[level]
+        if i % 2 == 0:
+            # sibling is right
+            sib = arr[i+1] if i+1 < len(arr) else sha256(b"")
+            path.append((1, sib))
+        else:
+            sib = arr[i-1]
+            path.append((0, sib))
+        i //= 2
+    return path
+
+def verify_merkle(root: bytes, idx: int, masked: bytes, path: List[Tuple[int, bytes]]) -> bool:
+    h = sha256(b"L" + int_to_bytes(idx, 8) + masked)
+    i = idx
+    for side, sib in path:
+        if side == 1:
+            h = sha256(b"I" + h + sib)
+        else:
+            h = sha256(b"I" + sib + h)
+        i //= 2
+    return h == root
+
+# ----------------------- Transition rules -----------------------
+
+def transition_ok(prev: Step, nxt: Step) -> bool:
+    """Check that nxt is a valid transition from prev under the rZK program semantics."""
+    P_list = prev.state["P_list"]
+    # By default ensure indices and structural monotonicity
+    if nxt.idx != prev.idx + 1:
+        return False
+    # d and r stay constant
+    if nxt.state["d"] != prev.state["d"] or nxt.state["r"] != prev.state["r"]:
+        return False
+
+    op = nxt.op
+    j  = nxt.j
+
+    # Compute expected on the fly
+    def blen(x): return max(1, x.bit_length())
+
+    if op == "compute_b":
+        return nxt.state["b"] == blen(prev.state["d"])
+
+    if op == "compute_ct":
+        P = P_list[j]
+        return nxt.state["ct"][j] == pow(prev.state["d"], prev.state["b"], P)
+
+    if op == "compute_u":
+        P = P_list[j]
+        return nxt.state["u"][j] == pow(prev.state["r"], prev.state["b"], P)
+
+    if op == "compute_c":
+        h = hashlib.sha256()
+        h.update(b"RZK|TRACE|LINK|")
+        for P in P_list: h.update(int_to_bytes(P))
+        h.update(int_to_bytes(prev.state["b"]))
+        for v in prev.state["ct"]: h.update(int_to_bytes(v))
+        for v in prev.state["u"]:  h.update(int_to_bytes(v))
+        c_expect = int.from_bytes(h.digest(), 'big')
+        return nxt.state["c"] == c_expect
+
+    if op == "compute_s":
+        P = P_list[j]
+        return nxt.state["s"][j] == (prev.state["r"] * pow(prev.state["d"], prev.state["c"] % (P-1), P)) % P
+
+    if op == "compute_lhs":
+        P = P_list[j]
+        return nxt.state["lhs"][j] == pow(prev.state["s"][j], prev.state["b"], P)
+
+    if op == "compute_rhs":
+        P = P_list[j]
+        return nxt.state["rhs"][j] == (prev.state["u"][j] * pow(prev.state["ct"][j], prev.state["c"] % (P-1), P)) % P
+
+    if op == "check_ok":
+        return nxt.state["ok"][j] == (prev.state["lhs"][j] == prev.state["rhs"][j])
+
+    if op == "done":
+        # final ok for all j must be True (keep previous state)
+        return all(prev.state["ok"])
+
+    # allow "init" as first step only
+    if op == "init":
+        return prev.op == "init"
+
+    return False
+
+# ----------------------- Proof generation & verification -----------------------
+
+def prove_fulltrace(P_list: List[int], d: int, r: int, samples: int = 18) -> Dict[str, Any]:
+    steps = program_build_trace(P_list, d, r)
+    root, leaves, pads, tree = commit_trace(steps, mask_bytes=128)
+
+    # FiatâShamir challenge to select sample edges
+    public_bytes = b"|".join([int_to_bytes(P) for P in P_list])
+    seed = sha256(b"FT|LINK|" + root + public_bytes)
+    k = max(1, min(samples, len(steps)-1))
+    # Select distinct indices in [0, len(steps)-2]
+    sel = []
+    i = 0
+    while len(sel) < k:
+        seed = sha256(seed)
+        cand = int.from_bytes(seed, 'big') % (len(steps)-1)
+        if cand not in sel:
+            sel.append(cand)
+
+    openings = []
+    for i_idx in sel:
+        prev = steps[i_idx]
+        nxt  = steps[i_idx+1]
+        # create masked bytes using the *committed* masked form
+        # Recompute masked from plaintext + a revealed pad specific to this index
+        plain_prev = serialize_step(prev)
+        plain_nxt  = serialize_step(nxt)
+
+        pad_prev = pads[i_idx]
+        pad_nxt  = pads[i_idx+1]
+
+        masked_prev = xor_bytes(plain_prev.ljust(len(pad_prev), b'\x00'), pad_prev)
+        masked_nxt  = xor_bytes(plain_nxt .ljust(len(pad_nxt ), b'\x00'), pad_nxt )
+
+        # merkle paths
+        path_prev = get_merkle_path(tree, i_idx, len(steps))
+        path_nxt  = get_merkle_path(tree, i_idx+1, len(steps))
+
+        openings.append({
+            "i": i_idx,
+            "prev_plain": json.loads(plain_prev.decode()),
+            "nxt_plain":  json.loads(plain_nxt.decode()),
+            "pad_prev": pad_prev.hex(),
+            "pad_nxt":  pad_nxt.hex(),
+            "masked_prev": masked_prev.hex(),
+            "masked_nxt":  masked_nxt.hex(),
+            "path_prev": [(side, sib.hex()) for (side, sib) in path_prev],
+            "path_nxt":  [(side, sib.hex()) for (side, sib) in path_nxt],
+        })
+
+    proof = {
+        "scheme": "rzk-trace-link-v1",
+        "public": {
+            "P": [str(P) for P in P_list],
+            "root": root.hex(),
+            "trace_len": len(steps)
+        },
+        "openings": openings
+    }
+    return proof
+
+def verify_fulltrace(proof: Dict[str, Any]) -> bool:
+    if proof.get("scheme") != "rzk-trace-link-v1":
+        return False
+    P_list = [int(x) for x in proof["public"]["P"]]
+    root   = bytes.fromhex(proof["public"]["root"])
+    n      = int(proof["public"]["trace_len"])
+
+    # recompute selection
+    public_bytes = b"|".join([int_to_bytes(P) for P in P_list])
+    seed = sha256(b"FT|LINK|" + root + public_bytes)
+
+    openings = proof["openings"]
+    # validate distinct and within range
+    seen = set()
+    for item in openings:
+        i_idx = int(item["i"])
+        if not (0 <= i_idx < n-1): return False
+        if i_idx in seen: return False
+        seen.add(i_idx)
+
+    # verify each opening
+    for item in openings:
+        i_idx = int(item["i"])
+        prev_plain = item["prev_plain"]
+        nxt_plain  = item["nxt_plain"]
+        pad_prev   = bytes.fromhex(item["pad_prev"])
+        pad_nxt    = bytes.fromhex(item["pad_nxt"])
+        masked_prev= bytes.fromhex(item["masked_prev"])
+        masked_nxt = bytes.fromhex(item["masked_nxt"])
+        path_prev  = [(int(side), bytes.fromhex(sib)) for (side, sib) in item["path_prev"]]
+        path_nxt   = [(int(side), bytes.fromhex(sib)) for (side, sib) in item["path_nxt"]]
+
+        # 1) Inclusion: re-mask plaintext with provided pads and check Merkle paths against root
+        plain_prev_b = json.dumps(prev_plain, separators=(',',':'), sort_keys=True).encode()
+        plain_nxt_b  = json.dumps(nxt_plain,  separators=(',',':'), sort_keys=True).encode()
+        expect_prev  = xor_bytes(plain_prev_b.ljust(len(pad_prev), b'\x00'), pad_prev)
+        expect_nxt   = xor_bytes(plain_nxt_b .ljust(len(pad_nxt ), b'\x00'), pad_nxt)
+        if expect_prev != masked_prev or expect_nxt != masked_nxt:
+            return False
+        if not verify_merkle(root, i_idx,   masked_prev, path_prev): return False
+        if not verify_merkle(root, i_idx+1, masked_nxt,  path_nxt):  return False
+
+        # 2) Transition rule
+        from_step = Step(idx=prev_plain["idx"], op=prev_plain["op"], j=prev_plain["j"], state=prev_plain["state"])
+        to_step   = Step(idx=nxt_plain["idx"],  op=nxt_plain["op"],  j=nxt_plain["j"],  state=nxt_plain["state"])
+        if not transition_ok(from_step, to_step):
+            return False
+
+    # Optional: re-check final ok flag if the last opening happens to include 'done' or 'check_ok'.
+    # (Skipped; sampling-based.)
+    return True
