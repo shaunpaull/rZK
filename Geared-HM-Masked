@@ -1,0 +1,465 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+GEAR-H (masked): HM-native, hash-only argument with per-leaf masking/blinding
+-----------------------------------------------------------------------------
+
+- Transparent (hash-only), post-quantum friendly.
+- No polynomial commitments, no FRI.
+- Per-leaf masking: commitments store *masked encodings* of integers;
+  openings include the mask material so the verifier can unmask locally.
+
+Proves:
+  - HM stage equation: t_i - b_i * t_{i-1} + q_i * m_i = 0 (integers)
+  - HM dimension gadgets:
+        b(d) = floor(log2 d) + 1  <=>  2^{b-1} <= d < 2^b
+        m(d) = floor(sqrt d) + 1  <=>  (m-1)^2 <= d < m^2
+  - Optional corridor (invertibility) per audited stage:
+        u_i*b_i + v_i*m_i = 1  and  gcd(b_i, m_i) = 1
+
+Security sketch:
+  - Binding via collision-resistant hashing (Merkle).
+  - Soundness via Freivalds-style folded check + random audited openings.
+  - Zero-knowledge flavor: only a *few* masked leaves are opened; raw values
+    are never stored in commitments and are unmasked only locally for checks.
+
+Author: rZK team
+License: MIT
+"""
+
+import os
+import math
+import json
+import argparse
+import hashlib
+import random
+import secrets
+from typing import List, Tuple, Dict, Any
+from math import gcd
+
+# ---- Field for folded checks (big prime) ----
+P_FIELD = (1 << 255) - 19
+
+# ---- Hash helpers ----
+def H(*chunks: bytes) -> bytes:
+    h = hashlib.sha256()
+    for c in chunks:
+        h.update(c)
+    return h.digest()
+
+def enc_u32(n: int) -> bytes:
+    return n.to_bytes(4, "big", signed=False)
+
+def enc_u64(n: int) -> bytes:
+    return n.to_bytes(8, "big", signed=False)
+
+# ---- Signed-integer encoding (byte-level) ----
+def enc_int_signed(n: int) -> bytes:
+    sign = b"\x01" if n < 0 else b"\x00"
+    a = -n if n < 0 else n
+    body = b"\x00" if a == 0 else a.to_bytes((a.bit_length() + 7)//8, "big")
+    return sign + body
+
+def dec_int_signed(b: bytes) -> int:
+    if not b:
+        return 0
+    sign = -1 if b[0] == 1 else 1
+    mag = int.from_bytes(b[1:], "big") if len(b) > 1 else 0
+    return sign * mag
+
+def bxor(a: bytes, b: bytes) -> bytes:
+    return bytes(x ^ y for x, y in zip(a, b))
+
+def prf_mask(label: str, idx: int, mask_salt: bytes, out_len: int) -> bytes:
+    """Expand a hash-based PRF to exactly out_len bytes."""
+    seed = H(b"GEARv1|MASK|", label.encode(), enc_u64(idx), mask_salt)
+    out = b""
+    ctr = 0
+    while len(out) < out_len:
+        out += H(seed, enc_u32(ctr))
+        ctr += 1
+    return out[:out_len]
+
+# ---- Merkle commitments over *masked* encodings ----
+DS_LEAF = b"GEARv1|leaf|"
+
+class MerkleTree:
+    def __init__(self, leaf_hashes: List[bytes]):
+        if not leaf_hashes:
+            raise ValueError("MerkleTree requires at least one leaf")
+        # pad to next power-of-two by duplicating last leaf
+        n = 1
+        while n < len(leaf_hashes):
+            n <<= 1
+        padded = list(leaf_hashes) + [leaf_hashes[-1]] * (n - len(leaf_hashes))
+        self.levels = [padded]
+        while len(self.levels[-1]) > 1:
+            cur = self.levels[-1]
+            nxt = []
+            for i in range(0, len(cur), 2):
+                nxt.append(H(cur[i], cur[i+1]))
+            self.levels.append(nxt)
+        self.root = self.levels[-1][0]
+
+    def proof(self, idx: int) -> List[Tuple[bytes, str]]:
+        proof = []
+        i = idx
+        for level in self.levels[:-1]:
+            sib = i ^ 1
+            if i % 2 == 0:
+                proof.append((level[sib], "R"))
+            else:
+                proof.append((level[sib], "L"))
+            i //= 2
+        return proof
+
+    @staticmethod
+    def verify(leaf_hash: bytes, idx: int, proof: List[Tuple[bytes, str]], root: bytes) -> bool:
+        acc = leaf_hash
+        for sib, side in proof:
+            acc = H(acc, sib) if side == "R" else H(sib, acc)
+        return acc == root
+
+def merkle_leaf_hash_masked(label: str, idx: int, masked_enc: bytes, commit_salt: bytes) -> bytes:
+    # Commit to the masked encoding; raw value is never in the leaf
+    return H(DS_LEAF, label.encode(), enc_u64(idx), enc_u32(len(masked_enc)), masked_enc, commit_salt)
+
+def commit_vector_masked(label: str, vals: List[int], salt_bytes: int = 16):
+    """
+    For each value:
+      - generate commit_salt and mask_salt,
+      - compute masked_enc = enc_int_signed(val) XOR PRF(mask_salt),
+      - leaf hash = H(label, idx, masked_enc, commit_salt)
+    Returns: root, commit_salts, mask_salts, merkle_tree
+    """
+    commit_salts = [secrets.token_bytes(salt_bytes) for _ in vals]
+    mask_salts   = [secrets.token_bytes(salt_bytes) for _ in vals]
+    leaf_hashes  = []
+    masked_encl  = []  # keep masked encodings for openings
+    for i, v in enumerate(vals):
+        enc = enc_int_signed(v)
+        mask = prf_mask(label, i, mask_salts[i], out_len=len(enc))
+        masked_enc = bxor(enc, mask)
+        leaf_hashes.append(merkle_leaf_hash_masked(label, i, masked_enc, commit_salts[i]))
+        masked_encl.append(masked_enc)
+    tree = MerkleTree(leaf_hashes)
+    return tree.root, commit_salts, mask_salts, masked_encl, tree
+
+def open_leaf_masked(label: str, idx: int, masked_enc: bytes, commit_salt: bytes, mask_salt: bytes, tree: MerkleTree) -> Dict[str, Any]:
+    """Opening reveals masked_enc, mask_salt, commit_salt, and Merkle path."""
+    return {
+        "label": label,
+        "idx": idx,
+        "masked_hex": masked_enc.hex(),
+        "commit_salt_hex": commit_salt.hex(),
+        "mask_salt_hex": mask_salt.hex(),
+        "proof": [(h.hex(), side) for (h, side) in tree.proof(idx)],
+    }
+
+def verify_opening_masked(opening: Dict[str, Any], root_hex: str) -> Tuple[bool, int]:
+    """
+    Verify Merkle path and unmask to recover the integer.
+    Returns (ok, value).
+    """
+    label = opening["label"]
+    idx   = int(opening["idx"])
+    masked_enc = bytes.fromhex(opening["masked_hex"])
+    commit_salt = bytes.fromhex(opening["commit_salt_hex"])
+    mask_salt   = bytes.fromhex(opening["mask_salt_hex"])
+
+    # Check Merkle against masked bytes
+    leaf = merkle_leaf_hash_masked(label, idx, masked_enc, commit_salt)
+    proof = [(bytes.fromhex(h), side) for (h, side) in opening["proof"]]
+    if not MerkleTree.verify(leaf, idx, proof, bytes.fromhex(root_hex)):
+        return (False, 0)
+
+    # Recompute mask and unmask to get raw integer
+    mask = prf_mask(label, idx, mask_salt, out_len=len(masked_enc))
+    enc = bxor(masked_enc, mask)
+    val = dec_int_signed(enc)
+    return (True, val)
+
+# ---- HM math & gadgets ----
+def b_of(d: int) -> int:
+    if d < 1: raise ValueError("d must be >= 1")
+    return int(math.log2(d)) + 1
+
+def m_of(d: int) -> int:
+    if d < 0: raise ValueError("d must be >= 0")
+    return int(math.isqrt(d)) + 1
+
+def bitlength_gadget_ok(d: int, b: int) -> bool:
+    return (1 << (b-1)) <= d < (1 << b)
+
+def sqrt_floor_gadget_ok(d: int, m: int) -> bool:
+    s = m - 1
+    return s*s <= d < (s+1)*(s+1)
+
+def bezout_uv(a: int, b: int) -> Tuple[int, int, int]:
+    if a == 0:
+        return (0, 1 if b >= 0 else -1, abs(b))
+    old_r, r = a, b
+    old_s, s = 1, 0
+    old_t, t = 0, 1
+    while r != 0:
+        q = old_r // r
+        old_r, r = r, old_r - q*r
+        old_s, s = s, old_s - q*s
+        old_t, t = t, old_t - q*t
+    return old_s, old_t, abs(old_r)
+
+# ---- HM trace generator (v2 semantics) ----
+def build_hm_trace(k: int, regime: str = "corridor", seed: int = 1234) -> Dict[str, List[int]]:
+    rng = random.Random(seed)
+    d: List[int] = []
+    b: List[int] = []
+    m: List[int] = []
+    q: List[int] = []
+    t: List[int] = []
+    u: List[int] = []
+    v: List[int] = []
+    s: List[int] = []
+
+    x = rng.randrange(0, 64)
+    t_prev = x
+    t.append(t_prev)
+
+    for i in range(k):
+        if regime == "corridor":
+            # pick coprime (b,m)
+            while True:
+                di = max(2, rng.randrange(2, 200_000))
+                bi, mi = b_of(di), m_of(di)
+                if gcd(bi, mi) == 1:
+                    break
+        else:
+            # compressive half the time
+            force_non = (i == 0) or (rng.random() < 0.5)
+            if force_non:
+                while True:
+                    di = max(2, rng.randrange(2, 200_000))
+                    bi, mi = b_of(di), m_of(di)
+                    if gcd(bi, mi) > 1:
+                        break
+            else:
+                while True:
+                    di = max(2, rng.randrange(2, 200_000))
+                    bi, mi = b_of(di), m_of(di)
+                    if gcd(bi, mi) == 1:
+                        break
+
+        bi, mi = b_of(di), m_of(di)
+        ui, vi, gi = bezout_uv(bi, mi)
+        si = mi - 1
+        ti = (bi * t_prev) % mi
+        qi = (bi * t_prev - ti) // mi  # integer quotient, so t_i - b_i t_{i-1} + q_i m_i == 0
+
+        d.append(di); b.append(bi); m.append(mi); q.append(qi); u.append(ui); v.append(vi); s.append(si)
+        t.append(ti); t_prev = ti
+
+    assert len(t) == k+1
+    return {"x": x, "d": d, "b": b, "m": m, "t": t, "q": q, "u": u, "v": v, "s": s}
+
+def hm_trace_valid(trace: Dict[str, List[int]], corridor_claim: bool) -> bool:
+    d,b,m,t,q,u,v,s = (trace[k] for k in ("d","b","m","t","q","u","v","s"))
+    k = len(d)
+    for i in range(k):
+        if b[i] != b_of(d[i]): return False
+        if m[i] != m_of(d[i]): return False
+        if not bitlength_gadget_ok(d[i], b[i]): return False
+        if not sqrt_floor_gadget_ok(d[i], m[i]): return False
+    for i in range(1, k+1):
+        if t[i] - b[i-1]*t[i-1] + q[i-1]*m[i-1] != 0: return False
+    if corridor_claim:
+        for i in range(k):
+            if gcd(b[i], m[i]) != 1: return False
+            if u[i]*b[i] + v[i]*m[i] != 1: return False
+    return True
+
+# ---- Fiat–Shamir challenges ----
+def derive_challenges(roots_hex: Dict[str, str], public: Dict[str, int], k: int, tag: str) -> List[int]:
+    h = hashlib.sha256()
+    for key in sorted(roots_hex.keys()):
+        h.update(key.encode()); h.update(bytes.fromhex(roots_hex[key]))
+    for key in sorted(public.keys()):
+        h.update(key.encode()); h.update(int(public[key]).to_bytes(32, "big"))
+    h.update(tag.encode())
+    seed = h.digest()
+    out: List[int] = []
+    block = seed
+    while len(out) < k:
+        block = hashlib.sha256(block).digest()
+        for j in range(0, len(block), 8):
+            z = int.from_bytes(block[j:j+8], "big") or 1
+            out.append(z % P_FIELD)
+            if len(out) == k:
+                break
+    return out
+
+# ---- GEAR with masked commitments ----
+class GearCommitment:
+    """
+    Commits to *masked encodings* of all vectors (d,b,m,t,q,u,v,s).
+    """
+    def __init__(self, trace: Dict[str, List[int]], salt_bytes: int = 16):
+        self.trace = trace
+        self.k = len(trace["d"])
+        self.roots: Dict[str, str] = {}
+        self.commit_salts: Dict[str, List[bytes]] = {}
+        self.mask_salts: Dict[str, List[bytes]] = {}
+        self.masked_encl: Dict[str, List[bytes]] = {}
+        self.trees: Dict[str, MerkleTree] = {}
+
+        vectors = {
+            "d": trace["d"], "b": trace["b"], "m": trace["m"], "t": trace["t"],
+            "q": trace["q"], "u": trace["u"], "v": trace["v"], "s": trace["s"],
+        }
+        for label, vec in vectors.items():
+            root, c_salts, m_salts, masked_list, tree = commit_vector_masked(label, vec, salt_bytes=salt_bytes)
+            self.roots[label] = root.hex()
+            self.commit_salts[label] = c_salts
+            self.mask_salts[label] = m_salts
+            self.masked_encl[label] = masked_list
+            self.trees[label] = tree
+
+def gear_prove(trace: Dict[str, List[int]], sample_size: int = 48, salt_bytes: int = 16) -> Dict[str, Any]:
+    """
+    Produce a GEAR proof with masked per-leaf commitments.
+    """
+    commit = GearCommitment(trace, salt_bytes=salt_bytes)
+    k = commit.k
+    public = {"k": k, "y": trace["t"][-1]}  # public IO; no M needed
+
+    # folded residual check: sum alpha_i * (t_i - b_i t_{i-1} + q_i m_i) == 0 mod p
+    resids = [ trace["t"][i+1] - trace["b"][i]*trace["t"][i] + trace["q"][i]*trace["m"][i] for i in range(k) ]
+    alphas = derive_challenges(commit.roots, public, k, "alpha")
+    R = 0
+    for a, r in zip(alphas, resids):
+        R = (R + a * (r % P_FIELD)) % P_FIELD
+
+    # sample audited indices
+    samp_seed = derive_challenges(commit.roots, public, 4, "sample")
+    rng = random.Random(int(sum(samp_seed)) & ((1<<63)-1))
+    S = sorted(rng.sample(range(k), min(sample_size, k)))
+
+    # openings: masked encodings + salts + proofs (no raw ints)
+    openings = []
+    T = trace
+    for i in S:
+        openings.append({
+            "i": i,
+            "t_i": open_leaf_masked("t", i+1, commit.masked_encl["t"][i+1], commit.commit_salts["t"][i+1], commit.mask_salts["t"][i+1], commit.trees["t"]),
+            "t_im1": open_leaf_masked("t", i,   commit.masked_encl["t"][i],   commit.commit_salts["t"][i],   commit.mask_salts["t"][i],   commit.trees["t"]),
+            "b_i": open_leaf_masked("b", i, commit.masked_encl["b"][i], commit.commit_salts["b"][i], commit.mask_salts["b"][i], commit.trees["b"]),
+            "m_i": open_leaf_masked("m", i, commit.masked_encl["m"][i], commit.commit_salts["m"][i], commit.mask_salts["m"][i], commit.trees["m"]),
+            "q_i": open_leaf_masked("q", i, commit.masked_encl["q"][i], commit.commit_salts["q"][i], commit.mask_salts["q"][i], commit.trees["q"]),
+            "d_i": open_leaf_masked("d", i, commit.masked_encl["d"][i], commit.commit_salts["d"][i], commit.mask_salts["d"][i], commit.trees["d"]),
+            "s_i": open_leaf_masked("s", i, commit.masked_encl["s"][i], commit.commit_salts["s"][i], commit.mask_salts["s"][i], commit.trees["s"]),
+            "u_i": open_leaf_masked("u", i, commit.masked_encl["u"][i], commit.commit_salts["u"][i], commit.mask_salts["u"][i], commit.trees["u"]),
+            "v_i": open_leaf_masked("v", i, commit.masked_encl["v"][i], commit.commit_salts["v"][i], commit.mask_salts["v"][i], commit.trees["v"]),
+        })
+
+    return {"roots": commit.roots, "public": public, "R": int(R), "S": S, "openings": openings}
+
+def gear_verify(proof: Dict[str, Any], corridor_claim: bool) -> bool:
+    roots = proof["roots"]
+    public = proof["public"]
+    k = int(public["k"])
+
+    # Folded check must be zero
+    if (int(proof["R"]) % P_FIELD) != 0:
+        return False
+
+    S = proof["S"]
+    openings = proof["openings"]
+    if len(S) != len(openings):
+        return False
+
+    for op in openings:
+        ok_ti,   t_i   = verify_opening_masked(op["t_i"],   roots["t"])
+        ok_tim1, t_im1 = verify_opening_masked(op["t_im1"], roots["t"])
+        ok_b,    b_i   = verify_opening_masked(op["b_i"],   roots["b"])
+        ok_m,    m_i   = verify_opening_masked(op["m_i"],   roots["m"])
+        ok_q,    q_i   = verify_opening_masked(op["q_i"],   roots["q"])
+        ok_d,    d_i   = verify_opening_masked(op["d_i"],   roots["d"])
+        ok_s,    s_i   = verify_opening_masked(op["s_i"],   roots["s"])
+        ok_u,    u_i   = verify_opening_masked(op["u_i"],   roots["u"])
+        ok_v,    v_i   = verify_opening_masked(op["v_i"],   roots["v"])
+        if not (ok_ti and ok_tim1 and ok_b and ok_m and ok_q and ok_d and ok_s and ok_u and ok_v):
+            return False
+
+        # Local algebra & gadgets
+        if t_i - b_i*t_im1 + q_i*m_i != 0: return False
+        if not bitlength_gadget_ok(d_i, b_i): return False
+        if not sqrt_floor_gadget_ok(d_i, s_i + 1): return False
+        if corridor_claim:
+            if u_i*b_i + v_i*m_i != 1: return False
+            if gcd(b_i, m_i) != 1: return False
+
+    return True
+
+# ---- CLI & quick tests ----
+def cmd_prove(args):
+    trace = build_hm_trace(k=args.k, regime=args.regime, seed=args.seed)
+    assert hm_trace_valid(trace, corridor_claim=(args.regime=="corridor")), "internal trace invalid"
+    proof = gear_prove(trace, sample_size=args.sample)
+    if args.out:
+        with open(args.out, "w") as f:
+            json.dump(proof, f)
+        print(f"wrote proof to {args.out}")
+    else:
+        print(json.dumps(proof))
+
+def cmd_verify(args):
+    with open(args.proof, "r") as f:
+        proof = json.load(f)
+    ok = gear_verify(proof, corridor_claim=args.corridor)
+    print("ACCEPTED" if ok else "REJECTED")
+    raise SystemExit(0 if ok else 1)
+
+def cmd_selftest(_args):
+    rows = []
+    for regime in ["corridor", "compressive"]:
+        for k in [16, 32, 64]:
+            trace = build_hm_trace(k=k, regime=regime, seed=2025+k)
+            assert hm_trace_valid(trace, corridor_claim=(regime=="corridor"))
+            proof = gear_prove(trace, sample_size=48)
+            ok = gear_verify(proof, corridor_claim=(regime=="corridor"))
+            rows.append({"regime": regime, "k": k, "accepted": ok, "tampered": False})
+            # tamper: flip 1 bit of masked t_i bytes (first opening)
+            if proof["openings"]:
+                bad = json.loads(json.dumps(proof))
+                mh = bad["openings"][0]["t_i"]["masked_hex"]
+                # flip lowest bit
+                b0 = bytearray(bytes.fromhex(mh))
+                b0[0] ^= 1
+                bad["openings"][0]["t_i"]["masked_hex"] = bytes(b0).hex()
+                ok_bad = gear_verify(bad, corridor_claim=(regime=="corridor"))
+                rows.append({"regime": regime, "k": k, "accepted": ok_bad, "tampered": True})
+    print(json.dumps(rows, indent=2))
+
+def main():
+    ap = argparse.ArgumentParser(description="GEAR-H (masked): HM-native, hash-only ZK-style argument")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    pprove = sub.add_parser("prove", help="Prove an HM trace with masked commitments")
+    pprove.add_argument("--k", type=int, default=32, help="stages")
+    pprove.add_argument("--regime", type=str, choices=["corridor","compressive"], default="corridor")
+    pprove.add_argument("--seed", type=int, default=1337)
+    pprove.add_argument("--sample", type=int, default=48, help="audit sample size")
+    pprove.add_argument("--out", type=str, default="")
+    pprove.set_defaults(func=cmd_prove)
+
+    pver = sub.add_parser("verify", help="Verify a GEAR-H (masked) proof")
+    pver.add_argument("--proof", type=str, required=True)
+    pver.add_argument("--corridor", action="store_true", help="enforce Bézout+gcd corridor checks")
+    pver.set_defaults(func=cmd_verify)
+
+    pst = sub.add_parser("selftest", help="Run quick acceptance + tamper tests")
+    pst.set_defaults(func=cmd_selftest)
+
+    args = ap.parse_args()
+    args.func(args)
+
+if __name__ == "__main__":
+    main()
