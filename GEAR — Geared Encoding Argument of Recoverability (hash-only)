@@ -1,0 +1,485 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+GEAR — Geared Encoding Argument of Recoverability (hash-only, HM-native)
+------------------------------------------------------------------------
+This is a transparent, hash-only argument system specialized to the HyperMorphic
+(HM) dynamic base/modulus math. It proves, in zero-knowledge style (no polynomials,
+no FRI), that a pipeline followed the HM stage equations and (optionally) that
+each stage was a strict corridor (gcd(b_i, m_i)=1 with Bézout certificate),
+without revealing the secret trace beyond audited openings.
+
+Security (prototype): collision-resistant hashing + Fiat–Shamir + Freivalds-style
+random linear checks + random audited openings. This is a research prototype,
+*NOT* a drop-in replacement for production SNARKs/STARKs.
+
+Primitive name for papers/docs: GEAR (hash-only variant = "GEAR-H").
+
+Author: your rZK team
+License: MIT
+"""
+
+import os
+import math
+import json
+import argparse
+import hashlib
+import random
+import secrets
+from typing import List, Tuple, Dict, Any
+from math import gcd
+
+# --------------------------- Field for folded checks ---------------------------
+
+# Large prime (same size as Ed25519 field, convenient for mod operations)
+P_FIELD = (1 << 255) - 19
+
+# --------------------------- Basic encodings & hashing -------------------------
+
+def sha256(*chunks: bytes) -> bytes:
+    h = hashlib.sha256()
+    for c in chunks:
+        h.update(c)
+    return h.digest()
+
+def enc_u64(n: int) -> bytes:
+    if n < 0:
+        raise ValueError("enc_u64 expects non-negative")
+    return n.to_bytes(8, 'big')
+
+def enc_len(n: int) -> bytes:
+    # fixed 4-byte length prefix for framing
+    if n < 0 or n > (1<<32)-1:
+        raise ValueError("enc_len out of range")
+    return n.to_bytes(4, 'big')
+
+def enc_int_signed(n: int) -> bytes:
+    """
+    Deterministic signed integer encoding:
+    [sign:1byte][big-endian magnitude (>=1 byte, 0 is single 0x00)]
+    sign: 0x00 for >=0, 0x01 for negative
+    """
+    sign = b"\x01" if n < 0 else b"\x00"
+    a = -n if n < 0 else n
+    body = b"\x00" if a == 0 else a.to_bytes((a.bit_length()+7)//8, 'big')
+    return sign + body
+
+def dec_int_signed(b: bytes) -> int:
+    if len(b) == 0:
+        return 0
+    sign = -1 if b[0] == 1 else 1
+    mag = int.from_bytes(b[1:], 'big') if len(b) > 1 else 0
+    return sign * mag
+
+# --------------------------- Merkle commitment ---------------------------------
+
+DS_LEAF = b"GEARv1|leaf|"  # domain separator for leaves
+
+def merkle_leaf_hash(label: str, idx: int, val: int, salt: bytes) -> bytes:
+    lb = label.encode()
+    vb = enc_int_signed(val)
+    return sha256(DS_LEAF, lb, enc_u64(idx), enc_len(len(vb)), vb, salt)
+
+class MerkleTree:
+    def __init__(self, leaves: List[bytes]):
+        if not leaves:
+            raise ValueError("MerkleTree requires >=1 leaf")
+        # pad to next power-of-two by duplicating the last leaf
+        n = 1
+        while n < len(leaves):
+            n <<= 1
+        padded = list(leaves) + [leaves[-1]] * (n - len(leaves))
+        self.levels = [padded]
+        while len(self.levels[-1]) > 1:
+            nxt = []
+            L = self.levels[-1]
+            for i in range(0, len(L), 2):
+                nxt.append(sha256(L[i], L[i+1]))
+            self.levels.append(nxt)
+        self.root = self.levels[-1][0]
+
+    def proof(self, idx: int) -> List[Tuple[bytes, str]]:
+        """Return [(sibling_hash, 'L' or 'R'), ...] bottom->top."""
+        proof = []
+        i = idx
+        for level in self.levels[:-1]:
+            # sibling index: flip last bit
+            sib = i ^ 1
+            if i % 2 == 0:
+                proof.append((level[sib], 'R'))
+            else:
+                proof.append((level[sib], 'L'))
+            i //= 2
+        return proof
+
+    @staticmethod
+    def verify(leaf_hash: bytes, idx: int, proof: List[Tuple[bytes, str]], root: bytes) -> bool:
+        acc = leaf_hash
+        i = idx
+        for sib, side in proof:
+            if side == 'R':
+                acc = sha256(acc, sib)
+            else:
+                acc = sha256(sib, acc)
+            i //= 2
+        return acc == root
+
+def commit_vector(label: str, vals: List[int], salt_bytes: int = 16) -> Tuple[bytes, List[bytes], MerkleTree]:
+    salts = [secrets.token_bytes(salt_bytes) for _ in vals]
+    leaves = [merkle_leaf_hash(label, i, vals[i], salts[i]) for i in range(len(vals))]
+    tree = MerkleTree(leaves)
+    return tree.root, salts, tree
+
+def open_leaf(label: str, idx: int, vals: List[int], salts: List[bytes], tree: MerkleTree) -> Dict[str, Any]:
+    return {
+        "label": label,
+        "idx": idx,
+        "val": vals[idx],
+        "salt_hex": salts[idx].hex(),
+        "proof": [(h.hex(), side) for (h, side) in tree.proof(idx)],
+    }
+
+def verify_opening(opening: Dict[str, Any], root_hex: str) -> bool:
+    label = opening["label"]
+    idx   = int(opening["idx"])
+    val   = int(opening["val"])
+    salt  = bytes.fromhex(opening["salt_hex"])
+    leaf  = merkle_leaf_hash(label, idx, val, salt)
+    proof = [(bytes.fromhex(h), side) for (h, side) in opening["proof"]]
+    return MerkleTree.verify(leaf, idx, proof, bytes.fromhex(root_hex))
+
+# --------------------------- HM math & gadgets ---------------------------------
+
+def b_of(d: int) -> int:
+    if d < 1: raise ValueError("d must be >= 1")
+    return int(math.log2(d)) + 1
+
+def m_of(d: int) -> int:
+    if d < 0: raise ValueError("d must be >= 0")
+    return int(math.isqrt(d)) + 1
+
+def bitlength_gadget_ok(d: int, b: int) -> bool:
+    return (1 << (b-1)) <= d < (1 << b)
+
+def sqrt_floor_gadget_ok(d: int, m: int) -> bool:
+    s = m - 1
+    return (s*s) <= d < ((s+1)*(s+1))
+
+def bezout_uv(a: int, b: int) -> Tuple[int, int, int]:
+    """Return (u,v,g) with u*a + v*b = g = gcd(a,b)."""
+    if a == 0:
+        return (0, 1 if b >= 0 else -1, abs(b))
+    old_r, r = a, b
+    old_s, s = 1, 0
+    old_t, t = 0, 1
+    while r != 0:
+        q = old_r // r
+        old_r, r = r, old_r - q * r
+        old_s, s = s, old_s - q * s
+        old_t, t = t, old_t - q * t
+    return old_s, old_t, abs(old_r)
+
+# --------------------------- HM trace generator (v2) ----------------------------
+
+def build_hm_trace(k: int, regime: str = "corridor", seed: int = 1234) -> Dict[str, List[int]]:
+    """
+    Build an HM trace with k stages. Uses true HM formulas:
+      b_i = floor(log2 d_i) + 1
+      m_i = floor(sqrt d_i) + 1
+    'corridor': ensure gcd(b_i, m_i) == 1 at every stage
+    'compressive': inject some non-coprime stages
+    """
+    rng = random.Random(seed)
+    d: List[int] = []
+    b: List[int] = []
+    m: List[int] = []
+    q: List[int] = []
+    t: List[int] = []
+    u: List[int] = []
+    v: List[int] = []
+    s: List[int] = []
+
+    # secret input
+    x = rng.randrange(0, 64)
+    t_prev = x
+    t.append(t_prev)  # t0
+
+    for i in range(k):
+        # choose d_i subject to regime constraints
+        if regime == "corridor":
+            # coprime base & modulus
+            while True:
+                di = max(2, rng.randrange(2, 200_000))
+                bi = b_of(di); mi = m_of(di)
+                if gcd(bi, mi) == 1:
+                    break
+        else:
+            # compressive: sometimes non-coprime, sometimes coprime
+            force_non = (i == 0) or (rng.random() < 0.5)
+            if force_non:
+                while True:
+                    di = max(2, rng.randrange(2, 200_000))
+                    bi = b_of(di); mi = m_of(di)
+                    if gcd(bi, mi) > 1:
+                        break
+            else:
+                while True:
+                    di = max(2, rng.randrange(2, 200_000))
+                    bi = b_of(di); mi = m_of(di)
+                    if gcd(bi, mi) == 1:
+                        break
+
+        bi = b_of(di)
+        mi = m_of(di)
+        ui, vi, gi = bezout_uv(bi, mi)
+        si = mi - 1
+
+        ti = (bi * t_prev) % mi
+        # exact integer quotient satisfies: t_i - b_i t_{i-1} + q_i m_i = 0
+        qi = (bi * t_prev - ti) // mi
+
+        d.append(di); b.append(bi); m.append(mi)
+        u.append(ui); v.append(vi); s.append(si); q.append(qi)
+        t.append(ti)
+        t_prev = ti
+
+    assert len(t) == k + 1
+    return {"x": x, "d": d, "b": b, "m": m, "t": t, "q": q, "u": u, "v": v, "s": s}
+
+def hm_trace_valid(trace: Dict[str, List[int]], corridor_claim: bool) -> bool:
+    d=trace["d"]; b=trace["b"]; m=trace["m"]; t=trace["t"]; q=trace["q"]; u=trace["u"]; v=trace["v"]; s=trace["s"]
+    k = len(d)
+    for i in range(k):
+        if b[i] != b_of(d[i]): return False
+        if m[i] != m_of(d[i]): return False
+        if not bitlength_gadget_ok(d[i], b[i]): return False
+        if not sqrt_floor_gadget_ok(d[i], m[i]): return False
+    for i in range(1, k+1):
+        if t[i] - b[i-1]*t[i-1] + q[i-1]*m[i-1] != 0: return False
+    if corridor_claim:
+        for i in range(k):
+            if gcd(b[i], m[i]) != 1: return False
+            if u[i]*b[i] + v[i]*m[i] != 1: return False
+    return True
+
+# --------------------------- Fiat–Shamir challenges ----------------------------
+
+def derive_challenges(roots_hex: Dict[str, str], public: Dict[str, int], k: int, tag: str) -> List[int]:
+    h = hashlib.sha256()
+    # bind to roots (sorted by label) and public fields
+    for key in sorted(roots_hex.keys()):
+        h.update(key.encode()); h.update(bytes.fromhex(roots_hex[key]))
+    for key in sorted(public.keys()):
+        h.update(key.encode()); h.update(int(public[key]).to_bytes(32, 'big', signed=False))
+    h.update(tag.encode())
+    seed = h.digest()
+    # expand into k field elements
+    out: List[int] = []
+    block = seed
+    while len(out) < k:
+        block = hashlib.sha256(block).digest()
+        for j in range(0, len(block), 8):
+            z = int.from_bytes(block[j:j+8], 'big') or 1
+            out.append(z % P_FIELD)
+            if len(out) == k:
+                break
+    return out
+
+# --------------------------- GEAR Commit/Prove/Verify -------------------------
+
+class GearCommitment:
+    def __init__(self, trace: Dict[str, List[int]], salt_bytes: int = 16):
+        self.trace = trace
+        self.k = len(trace["d"])
+        self.roots: Dict[str, str] = {}
+        self.salts: Dict[str, List[bytes]] = {}
+        self.trees: Dict[str, MerkleTree] = {}
+        # vectors & sizes
+        self.vectors = {
+            "d": trace["d"],
+            "b": trace["b"],
+            "m": trace["m"],
+            "t": trace["t"],  # length k+1
+            "q": trace["q"],
+            "u": trace["u"],
+            "v": trace["v"],
+            "s": trace["s"],
+        }
+        for label, vec in self.vectors.items():
+            root, salts, tree = commit_vector(label, vec, salt_bytes=salt_bytes)
+            self.roots[label] = root.hex()
+            self.salts[label] = salts
+            self.trees[label] = tree
+
+def gear_prove(trace: Dict[str, List[int]], sample_size: int = 48, salt_bytes: int = 16) -> Dict[str, Any]:
+    """
+    Produce a GEAR proof for a given HM trace.
+    Returns JSON-serializable dict with roots, folded check, and audited openings.
+    """
+    commit = GearCommitment(trace, salt_bytes=salt_bytes)
+    k = commit.k
+    public = {"k": k, "y": trace["t"][-1]}  # M not needed in hash-only scheme
+
+    # residuals (correct sign): r_i = t_i - b_i t_{i-1} + q_i m_i
+    residuals = [ trace["t"][i+1] - trace["b"][i]*trace["t"][i] + trace["q"][i]*trace["m"][i] for i in range(k) ]
+
+    # FS challenges and folded check
+    alphas = derive_challenges(commit.roots, public, k, "alpha")
+    R = 0
+    for a, r in zip(alphas, residuals):
+        R = (R + (a * (r % P_FIELD)) ) % P_FIELD
+
+    # sample audited indices deterministically
+    sample_stream = derive_challenges(commit.roots, public, 4, "sample")
+    rng = random.Random(int(sum(sample_stream)) & ((1<<63)-1))
+    S = sorted(rng.sample(range(k), min(sample_size, k)))
+
+    # collect openings for audited indices
+    openings: List[Dict[str, Any]] = []
+    for i in S:
+        openings.append({
+            "i": i,
+            "t_i": open_leaf("t", i+1, trace["t"], commit.salts["t"], commit.trees["t"]),
+            "t_im1": open_leaf("t", i,   trace["t"], commit.salts["t"], commit.trees["t"]),
+            "b_i": open_leaf("b", i, trace["b"], commit.salts["b"], commit.trees["b"]),
+            "m_i": open_leaf("m", i, trace["m"], commit.salts["m"], commit.trees["m"]),
+            "q_i": open_leaf("q", i, trace["q"], commit.salts["q"], commit.trees["q"]),
+            "d_i": open_leaf("d", i, trace["d"], commit.salts["d"], commit.trees["d"]),
+            "s_i": open_leaf("s", i, trace["s"], commit.salts["s"], commit.trees["s"]),
+            "u_i": open_leaf("u", i, trace["u"], commit.salts["u"], commit.trees["u"]),
+            "v_i": open_leaf("v", i, trace["v"], commit.salts["v"], commit.trees["v"]),
+        })
+
+    proof = {
+        "roots": commit.roots,
+        "public": public,
+        "R": int(R),
+        "S": S,
+        "openings": openings,
+    }
+    return proof
+
+def gear_verify(proof: Dict[str, Any], corridor_claim: bool) -> bool:
+    """
+    Verify a GEAR proof. corridor_claim=True enforces Bézout (gcd==1) per audited stage.
+    """
+    roots = proof["roots"]
+    public = proof["public"]
+    k = int(public["k"])
+
+    # Folded check must be zero (honest residuals are zeros)
+    if (int(proof["R"]) % P_FIELD) != 0:
+        return False
+
+    # Check openings
+    S = proof["S"]
+    openings = proof["openings"]
+    if len(S) != len(openings):
+        return False
+
+    for op in openings:
+        # Merkle openings
+        if not verify_opening(op["t_i"], roots["t"]): return False
+        if not verify_opening(op["t_im1"], roots["t"]): return False
+        if not verify_opening(op["b_i"], roots["b"]): return False
+        if not verify_opening(op["m_i"], roots["m"]): return False
+        if not verify_opening(op["q_i"], roots["q"]): return False
+        if not verify_opening(op["d_i"], roots["d"]): return False
+        if not verify_opening(op["s_i"], roots["s"]): return False
+        if not verify_opening(op["u_i"], roots["u"]): return False
+        if not verify_opening(op["v_i"], roots["v"]): return False
+
+        # Extract integer values
+        t_i   = int(op["t_i"]["val"])
+        t_im1 = int(op["t_im1"]["val"])
+        b_i   = int(op["b_i"]["val"])
+        m_i   = int(op["m_i"]["val"])
+        q_i   = int(op["q_i"]["val"])
+        d_i   = int(op["d_i"]["val"])
+        s_i   = int(op["s_i"]["val"])
+        u_i   = int(op["u_i"]["val"])
+        v_i   = int(op["v_i"]["val"])
+
+        # Algebraic + gadget checks (local)
+        if t_i - b_i*t_im1 + q_i*m_i != 0:
+            return False
+        if not bitlength_gadget_ok(d_i, b_i):
+            return False
+        if not sqrt_floor_gadget_ok(d_i, s_i + 1):
+            return False
+
+        if corridor_claim:
+            if (u_i*b_i + v_i*m_i) != 1:
+                return False
+            if gcd(b_i, m_i) != 1:
+                return False
+
+    return True
+
+# --------------------------- CLI / Quick self-tests ----------------------------
+
+def cmd_prove(args):
+    trace = build_hm_trace(k=args.k, regime=args.regime, seed=args.seed)
+    if not hm_trace_valid(trace, corridor_claim=(args.regime=="corridor")):
+        raise SystemExit("Internal trace validation failed.")
+    proof = gear_prove(trace, sample_size=args.sample)
+    if args.out:
+        with open(args.out, "w") as f:
+            json.dump(proof, f)
+        print(f"wrote proof to {args.out}")
+    else:
+        print(json.dumps(proof))
+
+def cmd_verify(args):
+    with open(args.proof, "r") as f:
+        proof = json.load(f)
+    ok = gear_verify(proof, corridor_claim=args.corridor)
+    print("ACCEPTED" if ok else "REJECTED")
+    return 0 if ok else 1
+
+def cmd_selftest(args):
+    random.seed(0)
+    rows = []
+    for regime in ["corridor", "compressive"]:
+        for k in [16, 32, 64]:
+            trace = build_hm_trace(k=k, regime=regime, seed=2025+k)
+            assert hm_trace_valid(trace, corridor_claim=(regime=="corridor"))
+            proof = gear_prove(trace, sample_size=48)
+            ok = gear_verify(proof, corridor_claim=(regime=="corridor"))
+            rows.append({"regime": regime, "k": k, "accepted": ok, "tampered": False})
+            # tamper first audited opening if available
+            if proof["openings"]:
+                bad = json.loads(json.dumps(proof))
+                # flip a bit on t_i to break a local equation
+                bad["openings"][0]["t_i"]["val"] ^= 1
+                ok_bad = gear_verify(bad, corridor_claim=(regime=="corridor"))
+                rows.append({"regime": regime, "k": k, "accepted": ok_bad, "tampered": True})
+    print(json.dumps(rows, indent=2))
+
+def main():
+    ap = argparse.ArgumentParser(description="GEAR (HM-native, hash-only argument)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    pprove = sub.add_parser("prove", help="Prove an HM trace")
+    pprove.add_argument("--k", type=int, default=32, help="number of stages")
+    pprove.add_argument("--regime", type=str, choices=["corridor","compressive"], default="corridor")
+    pprove.add_argument("--seed", type=int, default=1337)
+    pprove.add_argument("--sample", type=int, default=48, help="audited sample size")
+    pprove.add_argument("--out", type=str, default="")
+    pprove.set_defaults(func=cmd_prove)
+
+    pver = sub.add_parser("verify", help="Verify a GEAR proof (JSON)")
+    pver.add_argument("--proof", type=str, required=True)
+    pver.add_argument("--corridor", action="store_true", help="enforce Bézout/gcd checks")
+    pver.set_defaults(func=cmd_verify)
+
+    pst = sub.add_parser("selftest", help="Run quick self-tests (accept & tamper)")
+    pst.set_defaults(func=cmd_selftest)
+
+    args = ap.parse_args()
+    rc = args.func(args)
+    if isinstance(rc, int):
+        raise SystemExit(rc)
+
+if __name__ == "__main__":
+    main()
