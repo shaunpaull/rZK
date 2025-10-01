@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""
+ResonanceZK (rZK) Demo Suite — HyperMorphic HM(d) Zero-Knowledge Proofs
+=======================================================================
+
+This script provides a runnable reference for:
+  1) HM-ZK (single relation): prove knowledge of a secret d such that
+       ct ≡ d^{b(d)} (mod P), where b(d) = bit_length(d).
+  2) HM-ZK-Link (multi-relation): prove the same secret d simultaneously satisfies
+       ct_i ≡ d^{b_i} (mod P_i) for i in 1..N, using ONE Fiat–Shamir challenge.
+
+Security model:
+- Discrete log hardness in (Z/PZ)* for prime P (and each P_i).
+- Fiat–Shamir transform in the Random Oracle Model (SHA-256).
+- This is a pedagogical, unaudited reference. DO NOT use as-is in production.
+
+CLI:
+  python rzk_demo.py demo
+  python rzk_demo.py bench --trials 30
+  python rzk_demo.py prove --P curve25519 --out single.json [--d 12345]
+  python rzk_demo.py verify --in single.json
+  python rzk_demo.py link-prove --P curve25519 --P mersenne521 --out link.json [--d 98765]
+  python rzk_demo.py link-verify --in link.json
+
+Author: (c) 2025 ResonanceZK / HyperMorphic
+License: MIT
+"""
+
+from __future__ import annotations
+import argparse, json, hashlib, secrets, sys, math
+from dataclasses import dataclass
+from typing import List, Dict, Any, Tuple
+
+# --------------------------- Parameters & Helpers ---------------------------
+
+PRIME_PRESETS: Dict[str, int] = {
+    "curve25519": 2**255 - 19,
+    "mersenne521": 2**521 - 1,
+}
+
+def parse_prime(s: str) -> int:
+    if s.lower() in PRIME_PRESETS:
+        return PRIME_PRESETS[s.lower()]
+    try:
+        val = int(s, 0)
+        if val <= 3:
+            raise ValueError("prime too small")
+        return val
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"Invalid prime '{s}': {e}")
+
+def bit_length(d: int) -> int:
+    return max(1, d.bit_length())
+
+def b_func(d: int) -> int:
+    return bit_length(d)
+
+def sha256_int(*parts: bytes) -> int:
+    h = hashlib.sha256()
+    for p in parts:
+        h.update(p)
+    return int.from_bytes(h.digest(), 'big')
+
+def int_to_bytes(x: int) -> bytes:
+    return x.to_bytes((x.bit_length() + 7)//8 or 1, 'big')
+
+def rand_nonzero_mod(p: int) -> int:
+    return secrets.randbelow(p-1) + 1
+
+# --------------------------- HM-ZK (single relation) ---------------------------
+
+@dataclass
+class HMZKProof:
+    u: int
+    s: int
+
+def hmzk_statement(d: int, P: int) -> Tuple[int, int]:
+    b = b_func(d)
+    ct = pow(d, b, P)
+    return b, ct
+
+def hmzk_prove(d: int, P: int) -> Dict[str, Any]:
+    b, ct = hmzk_statement(d, P)
+    r = rand_nonzero_mod(P)
+    u = pow(r, b, P)
+    ctx = b"RZK|HMZK|P|" + int_to_bytes(P) + b"|b|" + int_to_bytes(b) + b"|ct|" + int_to_bytes(ct) + b"|u|" + int_to_bytes(u)
+    c = sha256_int(ctx)
+    s = (r * pow(d, c % (P-1), P)) % P
+    transcript = {
+        "scheme": "rzk-hmzk-1",
+        "params": {"P": str(P), "b": b},
+        "statement": {"ct": str(ct)},
+        "commitment": {"u": str(u)},
+        "challenge": str(c),
+        "response": {"s": str(s)},
+    }
+    return transcript
+
+def hmzk_verify(transcript: Dict[str, Any]) -> bool:
+    if transcript.get("scheme") != "rzk-hmzk-1":
+        return False
+    P = int(transcript["params"]["P"])
+    b = int(transcript["params"]["b"])
+    ct = int(transcript["statement"]["ct"])
+    u  = int(transcript["commitment"]["u"])
+    s  = int(transcript["response"]["s"])
+    c  = int(transcript["challenge"])
+    ctx = b"RZK|HMZK|P|" + int_to_bytes(P) + b"|b|" + int_to_bytes(b) + b"|ct|" + int_to_bytes(ct) + b"|u|" + int_to_bytes(u)
+    c_check = sha256_int(ctx)
+    if c != c_check:
+        return False
+    lhs = pow(s, b, P)
+    rhs = (u * pow(ct, c % (P-1), P)) % P
+    return lhs == rhs
+
+# --------------------------- HM-ZK-Link (multi-relation) ---------------------------
+
+def hmzk_link_prove(d: int, primes: List[int]) -> Dict[str, Any]:
+    assert len(primes) >= 2, "Need at least two primes for link proof"
+    b_list, ct_list, u_list = [], [], []
+    r_bound = min(primes)
+    r = secrets.randbelow(r_bound-1) + 1
+    for P in primes:
+        b = b_func(d)
+        ct = pow(d, b, P)
+        u  = pow(r, b, P)
+        b_list.append(b); ct_list.append(ct); u_list.append(u)
+    h = hashlib.sha256()
+    h.update(b"RZK|HMZK-LINK|")
+    for P in primes: h.update(int_to_bytes(P))
+    for b in b_list: h.update(int_to_bytes(b))
+    for ct in ct_list: h.update(int_to_bytes(ct))
+    for u in u_list: h.update(int_to_bytes(u))
+    c = int.from_bytes(h.digest(), 'big')
+    s_list = []
+    for P in primes:
+        s_i = (r * pow(d, c % (P-1), P)) % P
+        s_list.append(s_i)
+    transcript = {
+        "scheme": "rzk-link-1",
+        "params": {"P": [str(P) for P in primes], "b": b_list},
+        "statements": [{"ct": str(ct)} for ct in ct_list],
+        "commitments": {"u": [str(u) for u in u_list]},
+        "challenge": str(c),
+        "responses": {"s": [str(s) for s in s_list]},
+    }
+    return transcript
+
+def hmzk_link_verify(transcript: Dict[str, Any]) -> bool:
+    if transcript.get("scheme") != "rzk-link-1":
+        return False
+    P_list = [int(x) for x in transcript["params"]["P"]]
+    b_list = [int(x) for x in transcript["params"]["b"]]
+    ct_list = [int(x["ct"]) for x in transcript["statements"]]
+    u_list  = [int(x) for x in transcript["commitments"]["u"]]
+    s_list  = [int(x) for x in transcript["responses"]["s"]]
+    c = int(transcript["challenge"])
+    if not (len(P_list) == len(b_list) == len(ct_list) == len(u_list) == len(s_list)):
+        return False
+    h = hashlib.sha256()
+    h.update(b"RZK|HMZK-LINK|")
+    for P in P_list: h.update(int_to_bytes(P))
+    for b in b_list: h.update(int_to_bytes(b))
+    for ct in ct_list: h.update(int_to_bytes(ct))
+    for u in u_list: h.update(int_to_bytes(u))
+    c_check = int.from_bytes(h.digest(), 'big')
+    if c != c_check:
+        return False
+    for P, b, ct, u, s in zip(P_list, b_list, ct_list, u_list, s_list):
+        lhs = pow(s, b, P)
+        rhs = (u * pow(ct, c % (P-1), P)) % P
+        if lhs != rhs:
+            return False
+    return True
+
+# --------------------------- Utilities & CLI ---------------------------
+
+def random_secret(P: int) -> int:
+    return rand_nonzero_mod(P)
+
+def write_json(path: str, obj: Dict[str, Any]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, sort_keys=False)
+
+def read_json(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def pretty_int_hex(x: int, width: int = 16) -> str:
+    h = hex(x)[2:]
+    if len(h) > width:
+        return "0x" + h[:width] + "..."
+    return "0x" + h
+
+def cmd_demo(args) -> int:
+    print("=== rZK Demo ===")
+    P1 = PRIME_PRESETS["curve25519"]
+    P2 = PRIME_PRESETS["mersenne521"]
+    d = random_secret(P1)
+
+    single = hmzk_prove(d, P1)
+    print("\n[HM-ZK] Single Relation")
+    print("P = curve25519")
+    print("b =", single["params"]["b"])
+    print("ct =", pretty_int_hex(int(single["statement"]["ct"])))
+    print("u  =", pretty_int_hex(int(single["commitment"]["u"])))
+    print("s  =", pretty_int_hex(int(single["response"]["s"])))
+    print("verify:", hmzk_verify(single))
+
+    link = hmzk_link_prove(d, [P1, P2])
+    print("\n[HM-ZK-Link] Two Relations (same d)")
+    print("P =", ["curve25519", "mersenne521"])
+    print("b =", link["params"]["b"])
+    print("ct =", [pretty_int_hex(int(x["ct"])) for x in link["statements"]])
+    print("verify:", hmzk_link_verify(link))
+    return 0
+
+def cmd_bench(args) -> int:
+    trials = int(args.trials)
+    P1 = PRIME_PRESETS["curve25519"]
+    P2 = PRIME_PRESETS["mersenne521"]
+    ok1 = ok2 = 0
+    for i in range(trials):
+        d1 = random_secret(P1)
+        tr1 = hmzk_prove(d1, P1)
+        ok1 += int(hmzk_verify(tr1))
+        d2 = random_secret(min(P1, P2))
+        tr2 = hmzk_link_prove(d2, [P1, P2])
+        ok2 += int(hmzk_link_verify(tr2))
+    print(f"[bench] HM-ZK pass rate:      {ok1}/{trials}")
+    print(f"[bench] HM-ZK-Link pass rate: {ok2}/{trials}")
+    return 0
+
+def cmd_prove(args) -> int:
+    P = parse_prime(args.P)
+    d = int(args.d) if args.d is not None else random_secret(P)
+    if not (1 <= d < P):
+        print("Error: d must be in [1, P-1]", file=sys.stderr); return 1
+    tr = hmzk_prove(d, P)
+    write_json(args.out, tr)
+    print(f"[prove] wrote {args.out}")
+    print(json.dumps(tr, indent=2))
+    return 0
+
+def cmd_verify(args) -> int:
+    tr = read_json(args.infile)
+    ok = hmzk_verify(tr)
+    print(f"[verify] {args.infile}: {ok}")
+    return 0
+
+def cmd_link_prove(args) -> int:
+    primes = [parse_prime(p) for p in args.P]
+    if len(primes) < 2:
+        print("Need at least two --P values for link-prove", file=sys.stderr); return 1
+    dmax = min(primes)
+    d = int(args.d) if args.d is not None else random_secret(dmax)
+    if not (1 <= d < dmax):
+        print(f"Error: d must be in [1, {dmax-1}]", file=sys.stderr); return 1
+    tr = hmzk_link_prove(d, primes)
+    write_json(args.out, tr)
+    print(f"[link-prove] wrote {args.out}")
+    print(json.dumps(tr, indent=2))
+    return 0
+
+def cmd_link_verify(args) -> int:
+    tr = read_json(args.infile)
+    ok = hmzk_link_verify(tr)
+    print(f"[link-verify] {args.infile}: {ok}")
+    return 0
+
+def build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="ResonanceZK (rZK) Demo Suite — HM(d) Zero-Knowledge Proofs")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("demo", help="run a quick single + link demo")
+    sp.set_defaults(func=cmd_demo)
+
+    sp = sub.add_parser("bench", help="run randomized trials")
+    sp.add_argument("--trials", type=int, default=20, help="number of trials (default: 20)")
+    sp.set_defaults(func=cmd_bench)
+
+    sp = sub.add_parser("prove", help="single-relation HM-ZK proof")
+    sp.add_argument("--P", required=True, help="prime modulus (name or integer), e.g. curve25519")
+    sp.add_argument("--d", help="secret d (decimal). If omitted, a random d in [1,P-1) is generated")
+    sp.add_argument("--out", default="single.json", help="output transcript JSON")
+    sp.set_defaults(func=cmd_prove)
+
+    sp = sub.add_parser("verify", help="verify a single-relation transcript JSON")
+    sp.add_argument("--in", dest="infile", required=True, help="input transcript JSON")
+    sp.set_defaults(func=cmd_verify)
+
+    sp = sub.add_parser("link-prove", help="multi-relation HM-ZK-Link proof with one challenge")
+    sp.add_argument("--P", action="append", required=True, help="repeat for each prime modulus, e.g. --P curve25519 --P mersenne521")
+    sp.add_argument("--d", help="secret d (decimal). If omitted, random in [1, min(P_i)-1)")
+    sp.add_argument("--out", default="link.json", help="output transcript JSON")
+    sp.set_defaults(func=cmd_link_prove)
+
+    sp = sub.add_parser("link-verify", help="verify a multi-relation transcript JSON")
+    sp.add_argument("--in", dest="infile", required=True, help="input transcript JSON")
+    sp.set_defaults(func=cmd_link_verify)
+    return p
+
+def main(argv: List[str]) -> int:
+    ap = build_argparser()
+    args = ap.parse_args(argv)
+    return args.func(args)
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
